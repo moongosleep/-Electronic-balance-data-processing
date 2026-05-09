@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 
 # 本地运行日志与自检输出
+batch_self_check.py
 debug_run_log.txt
 batch_test_report.csv
 batch_test_report.txt
