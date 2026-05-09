@@ -35,6 +35,7 @@ Windows 下 Excel 实验数据处理工具。
 
 from __future__ import annotations
 
+import atexit
 import math
 import os
 import sys
@@ -81,6 +82,7 @@ MODE_POLLUTANT = "污染物"
 PURE_WATER_OUTPUT_NAME_SUFFIX = "-纯水计算后"
 POLLUTANT_OUTPUT_NAME_SUFFIX = "-污染物计算后"
 OUTPUT_EXTENSION = ".xlsm"
+MAX_OUTPUT_CANDIDATE_COUNTER = 1000
 
 # 以后如果“每 5 个取平均”或“每 10 个取平均”的规则变化，只需要改这里。
 AVG_GROUP_1 = 5
@@ -266,9 +268,52 @@ class PollutantAnalysisResult(NamedTuple):
     five_group_count: int
 
 
+def _build_mode_detail(
+    mode: str,
+    runtime_settings: RuntimeSettings,
+    layout_result: OutputLayoutResult,
+    **kwargs: object,
+) -> str:
+    """构造完成提示中的实验模式详情。"""
+    if mode == MODE_PURE_WATER:
+        if layout_result.pressure_switch_index > 0:
+            switch_source = "自动识别" if layout_result.pressure_switch_auto_detected else "手动输入"
+            return (
+                f"实验模式：{MODE_PURE_WATER}\n"
+                f"时间s：{runtime_settings.time_seconds:g}\n"
+                f"膜面积cm2：{runtime_settings.membrane_area_cm2:g}\n"
+                f"结果行数：{layout_result.result_count}\n"
+                f"压力切换编号：{layout_result.pressure_switch_index}（{switch_source}）"
+            )
+
+        return (
+            f"实验模式：{MODE_PURE_WATER}\n"
+            f"时间s：{runtime_settings.time_seconds:g}\n"
+            f"膜面积cm2：{runtime_settings.membrane_area_cm2:g}\n"
+            f"结果行数：{layout_result.result_count}\n"
+            "压力模式：单一压力"
+        )
+
+    if mode == MODE_POLLUTANT:
+        pressure_bar = kwargs["pressure_bar"]
+        pure_water_flux = kwargs["pure_water_flux"]
+        return (
+            f"实验模式：{MODE_POLLUTANT}\n"
+            f"时间s：{runtime_settings.time_seconds:g}\n"
+            f"膜面积cm2：{runtime_settings.membrane_area_cm2:g}\n"
+            f"结果行数：{layout_result.result_count}\n"
+            f"运行压力bar：{pressure_bar:g}\n"
+            f"纯水通量：{pure_water_flux:g}"
+        )
+
+    raise ExcelProcessError(f"未知实验模式：{mode}")
+
+
 _TK_ROOT = None
 
 DEBUG_LOG_PATH = Path(__file__).resolve().with_name("debug_run_log.txt")
+DEBUG_LOG_BUFFER_LIMIT = 20
+_DEBUG_LOG_BUFFER: List[str] = []
 
 
 def debug_repr(value) -> str:
@@ -281,6 +326,23 @@ def debug_repr(value) -> str:
     if len(text) > 500:
         text = text[:497] + "..."
     return text
+
+
+def flush_debug_log_buffer() -> None:
+    """将缓冲的调试日志一次性写入文件，减少频繁 open/close。"""
+    if not _DEBUG_LOG_BUFFER:
+        return
+
+    try:
+        DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with DEBUG_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write("".join(_DEBUG_LOG_BUFFER))
+        _DEBUG_LOG_BUFFER.clear()
+    except Exception:
+        pass
+
+
+atexit.register(flush_debug_log_buffer)
 
 
 def debug_log_event(event: str, **fields) -> None:
@@ -299,10 +361,9 @@ def debug_log_event(event: str, **fields) -> None:
         ]
         for key, value in fields.items():
             lines.append(f"  {key}={debug_repr(value)}")
-        DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with DEBUG_LOG_PATH.open("a", encoding="utf-8") as handle:
-            handle.write("\n".join(lines))
-            handle.write("\n\n")
+        _DEBUG_LOG_BUFFER.append("\n".join(lines) + "\n\n")
+        if len(_DEBUG_LOG_BUFFER) >= DEBUG_LOG_BUFFER_LIMIT:
+            flush_debug_log_buffer()
     except Exception:
         pass
 
@@ -335,6 +396,41 @@ def get_tk_root():
             pass
 
     return _TK_ROOT
+
+
+def _force_window_to_foreground(root: object) -> None:
+    """尽量把 Tk 窗口带到 Windows 前台。"""
+    try:
+        import ctypes
+
+        hwnd = int(root.winfo_id())
+        ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        ctypes.windll.user32.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+
+
+def _center_and_focus_window(window: object, min_width: int, min_height: int) -> None:
+    """居中 Tk 窗口，并尽量把它聚焦到前台。"""
+    window.update_idletasks()
+    width = max(window.winfo_reqwidth(), min_width)
+    height = max(window.winfo_reqheight(), min_height)
+    screen_width = window.winfo_screenwidth()
+    screen_height = window.winfo_screenheight()
+    x = max((screen_width - width) // 2, 0)
+    y = max((screen_height - height) // 2, 0)
+    window.geometry(f"{width}x{height}+{x}+{y}")
+
+    try:
+        window.lift()
+        window.focus_force()
+        window.update()
+
+        # VS Code 集成终端有时不会把 Tk 窗口主动带到前台。
+        # 因此这里在 Windows 下额外调用 Win32 API，尽量把模式选择窗口推到前台。
+        _force_window_to_foreground(window)
+    except Exception:
+        pass
 
 
 def show_user_message(title: str, message: str, is_error: bool = False) -> None:
@@ -444,32 +540,7 @@ def select_experiment_mode() -> str:
     )
     root.protocol("WM_DELETE_WINDOW", cancel)
 
-    root.update_idletasks()
-    width = max(root.winfo_reqwidth(), 320)
-    height = max(root.winfo_reqheight(), 150)
-    screen_width = root.winfo_screenwidth()
-    screen_height = root.winfo_screenheight()
-    x = max((screen_width - width) // 2, 0)
-    y = max((screen_height - height) // 2, 0)
-    root.geometry(f"{width}x{height}+{x}+{y}")
-
-    try:
-        root.lift()
-        root.focus_force()
-        root.update()
-
-        # VS Code 集成终端有时不会把 Tk 窗口主动带到前台。
-        # 因此这里在 Windows 下额外调用 Win32 API，尽量把模式选择窗口推到前台。
-        try:
-            import ctypes
-
-            hwnd = int(root.winfo_id())
-            ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-            ctypes.windll.user32.SetForegroundWindow(hwnd)
-        except Exception:
-            pass
-    except Exception:
-        pass
+    _center_and_focus_window(root, 320, 150)
 
     print("正在显示模式选择窗口；如果没有看到，请查看任务栏或按 Alt+Tab 切换窗口。")
     root.mainloop()
@@ -689,29 +760,7 @@ def get_time_and_area_inputs() -> RuntimeSettings:
     time_entry.bind("<Return>", lambda _event: submit())
     area_entry.bind("<Return>", lambda _event: submit())
 
-    dialog.update_idletasks()
-    width = max(dialog.winfo_reqwidth(), 320)
-    height = max(dialog.winfo_reqheight(), 170)
-    screen_width = dialog.winfo_screenwidth()
-    screen_height = dialog.winfo_screenheight()
-    x = max((screen_width - width) // 2, 0)
-    y = max((screen_height - height) // 2, 0)
-    dialog.geometry(f"{width}x{height}+{x}+{y}")
-
-    try:
-        dialog.lift()
-        dialog.focus_force()
-        dialog.update()
-        try:
-            import ctypes
-
-            hwnd = int(dialog.winfo_id())
-            ctypes.windll.user32.ShowWindow(hwnd, 9)
-            ctypes.windll.user32.SetForegroundWindow(hwnd)
-        except Exception:
-            pass
-    except Exception:
-        pass
+    _center_and_focus_window(dialog, 320, 170)
 
     time_entry.focus_set()
     root.wait_window(dialog)
@@ -763,16 +812,6 @@ def get_pressure_input(label: str) -> float:
     )
 
 
-def get_single_pressure_input(label: str) -> float:
-    """\u517c\u5bb9\u65e7\u8c03\u7528\u540d\uff1a\u83b7\u53d6\u67d0\u4e00\u6bb5\u8fd0\u884c\u538b\u529b\u3002"""
-    return get_pressure_input(label)
-
-
-def get_single_pressure(label: str = "\u8fd0\u884c\u538b\u529b") -> float:
-    """\u6c61\u67d3\u7269\u6a21\u5f0f\u4f7f\u7528\uff1a\u53ea\u83b7\u53d6\u4e00\u6b21\u8fd0\u884c\u538b\u529b\u3002"""
-    return get_pressure_input(label)
-
-
 def get_pure_water_flux_input() -> float:
     """\u6c61\u67d3\u7269\u6a21\u5f0f\u4f7f\u7528\uff1a\u83b7\u53d6\u7528\u4e8e\u5f52\u4e00\u5316\u7684\u7eaf\u6c34\u901a\u91cf\u3002"""
     return get_positive_float_input(
@@ -809,10 +848,10 @@ def format_value_for_message(value) -> str:
     return text
 
 
-def parse_weight_value(value, row_number: int) -> float:
-    """校验并解析 B 列重量。"""
+def _parse_float_cell_value(value, row_label: str) -> float:
+    """按统一规则解析 Excel 单元格里的浮点数。"""
     if isinstance(value, bool):
-        raise ExcelProcessError(f"第 {row_number} 行 B 列重量格式异常：{format_value_for_message(value)}")
+        raise ExcelProcessError(f"{row_label}格式异常：{format_value_for_message(value)}")
 
     if isinstance(value, Real):
         number = float(value)
@@ -824,15 +863,20 @@ def parse_weight_value(value, row_number: int) -> float:
             number = float(text)
         except ValueError as exc:
             raise ExcelProcessError(
-                f"第 {row_number} 行 B 列重量格式异常：{format_value_for_message(value)}"
+                f"{row_label}格式异常：{format_value_for_message(value)}"
             ) from exc
     else:
-        raise ExcelProcessError(f"第 {row_number} 行 B 列重量格式异常：{format_value_for_message(value)}")
+        raise ExcelProcessError(f"{row_label}格式异常：{format_value_for_message(value)}")
 
     if not math.isfinite(number):
-        raise ExcelProcessError(f"第 {row_number} 行 B 列重量不是有效数字：{format_value_for_message(value)}")
+        raise ExcelProcessError(f"{row_label}不是有效数字：{format_value_for_message(value)}")
 
     return number
+
+
+def parse_weight_value(value, row_number: int) -> float:
+    """校验并解析 B 列重量。"""
+    return _parse_float_cell_value(value, f"第 {row_number} 行 B 列重量")
 
 
 def validate_time_value(value, row_number: int) -> None:
@@ -969,7 +1013,7 @@ def find_last_nonblank_row_in_column(worksheet, column_number: int) -> int:
     return 0
 
 
-def coerce_two_column_values(values, row_count: int) -> List[Tuple[object, object]]:
+def coerce_two_column_values(values: object, row_count: int) -> List[Tuple[object, object]]:
     """
     将 Excel Range.Value 统一为 [(A值, B值), ...]。
 
@@ -1095,10 +1139,10 @@ def iter_output_candidates(
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     yield target_directory / f"{base_stem}-{timestamp}{OUTPUT_EXTENSION}"
 
-    counter = 1
-    while True:
+    for counter in range(1, MAX_OUTPUT_CANDIDATE_COUNTER + 1):
         yield target_directory / f"{base_stem}-{timestamp}-{counter}{OUTPUT_EXTENSION}"
-        counter += 1
+
+    raise ExcelProcessError("?????????????")
 
 
 def reserve_unique_output_path(
@@ -1242,7 +1286,7 @@ def validate_group_size(group_size: int, name: str) -> None:
         raise ExcelProcessError(f"{name} 必须是大于 0 的整数，请检查脚本顶部配置。")
 
 
-def write_diff_formulas(worksheet, last_output_data_row: int) -> None:
+def write_diff_formulas(worksheet: object, last_output_data_row: int) -> None:
     """写入 C 列液滴质量差公式。"""
     if last_output_data_row < 3:
         return
@@ -1259,7 +1303,7 @@ def write_diff_formulas(worksheet, last_output_data_row: int) -> None:
 
 
 def write_average_formulas(
-    worksheet,
+    worksheet: object,
     target_column: int,
     group_size: int,
     last_output_data_row: int,
@@ -1304,28 +1348,7 @@ def write_result_base_area(
 
 def parse_result_h_value(value, result_index: int) -> float:
     """解析右侧结果区 H 列重量值，用于压力切换点检测。"""
-    if isinstance(value, bool):
-        raise ExcelProcessError(f"第 {result_index} 个 H 值格式异常：{format_value_for_message(value)}")
-
-    if isinstance(value, Real):
-        number = float(value)
-    elif isinstance(value, str):
-        text = normalize_text(value)
-        if "," in text and "." not in text:
-            text = text.replace(",", ".")
-        try:
-            number = float(text)
-        except ValueError as exc:
-            raise ExcelProcessError(
-                f"第 {result_index} 个 H 值格式异常：{format_value_for_message(value)}"
-            ) from exc
-    else:
-        raise ExcelProcessError(f"第 {result_index} 个 H 值格式异常：{format_value_for_message(value)}")
-
-    if not math.isfinite(number):
-        raise ExcelProcessError(f"第 {result_index} 个 H 值不是有效数字：{format_value_for_message(value)}")
-
-    return number
+    return _parse_float_cell_value(value, f"第 {result_index} 个 H 值")
 
 
 def read_result_h_values(worksheet, result_count: int) -> List[float]:
@@ -1506,29 +1529,7 @@ def prompt_manual_switch_index_gui(h_values: Sequence[float]) -> int:
     root.protocol("WM_DELETE_WINDOW", cancel)
     entry.bind("<Return>", lambda _event: submit())
 
-    root.update_idletasks()
-    width = max(root.winfo_width(), root.winfo_reqwidth(), 560)
-    height = max(root.winfo_height(), root.winfo_reqheight(), 620)
-    screen_width = root.winfo_screenwidth()
-    screen_height = root.winfo_screenheight()
-    x = max((screen_width - width) // 2, 0)
-    y = max((screen_height - height) // 2, 0)
-    root.geometry(f"{width}x{height}+{x}+{y}")
-
-    try:
-        root.lift()
-        root.focus_force()
-        root.update()
-        try:
-            import ctypes
-
-            hwnd = int(root.winfo_id())
-            ctypes.windll.user32.ShowWindow(hwnd, 9)
-            ctypes.windll.user32.SetForegroundWindow(hwnd)
-        except Exception:
-            pass
-    except Exception:
-        pass
+    _center_and_focus_window(root, 560, 620)
 
     entry.focus_set()
     root.mainloop()
@@ -1891,45 +1892,30 @@ def write_pollutant_analysis_area(
         pure_water_flux,
         runtime_settings,
     )
-    fifteen_group_count = write_pollutant_even_groups(
-        worksheet,
-        c_start_row,
-        c_count,
-        15,
-        COL_POLLUTANT_15_GROUP_PERMEABILITY,
-        COL_POLLUTANT_15_GROUP_NORMALIZED,
-        pressure_bar,
-        pure_water_flux,
-        runtime_settings,
-    )
-    ten_group_count = write_pollutant_even_groups(
-        worksheet,
-        c_start_row,
-        c_count,
-        10,
-        COL_POLLUTANT_10_GROUP_PERMEABILITY,
-        COL_POLLUTANT_10_GROUP_NORMALIZED,
-        pressure_bar,
-        pure_water_flux,
-        runtime_settings,
-    )
-    five_group_count = write_pollutant_even_groups(
-        worksheet,
-        c_start_row,
-        c_count,
-        5,
-        COL_POLLUTANT_5_GROUP_PERMEABILITY,
-        COL_POLLUTANT_5_GROUP_NORMALIZED,
-        pressure_bar,
-        pure_water_flux,
-        runtime_settings,
-    )
+    even_group_counts = {}
+    configs = [
+        (15, COL_POLLUTANT_15_GROUP_PERMEABILITY, COL_POLLUTANT_15_GROUP_NORMALIZED),
+        (10, COL_POLLUTANT_10_GROUP_PERMEABILITY, COL_POLLUTANT_10_GROUP_NORMALIZED),
+        (5, COL_POLLUTANT_5_GROUP_PERMEABILITY, COL_POLLUTANT_5_GROUP_NORMALIZED),
+    ]
+    for target_group_count, permeability_column, normalized_column in configs:
+        even_group_counts[target_group_count] = write_pollutant_even_groups(
+            worksheet,
+            c_start_row,
+            c_count,
+            target_group_count,
+            permeability_column,
+            normalized_column,
+            pressure_bar,
+            pure_water_flux,
+            runtime_settings,
+        )
 
     return PollutantAnalysisResult(
         five_point_count=five_point_count,
-        fifteen_group_count=fifteen_group_count,
-        ten_group_count=ten_group_count,
-        five_group_count=five_group_count,
+        fifteen_group_count=even_group_counts[15],
+        ten_group_count=even_group_counts[10],
+        five_group_count=even_group_counts[5],
     )
 
 
@@ -2191,54 +2177,12 @@ def create_pollutant_scatter_charts(
 
 def parse_result_m_value(value, result_index: int) -> float:
     """解析右侧结果区 M 列渗透性值，用于后半段平均值统计。"""
-    if isinstance(value, bool):
-        raise ExcelProcessError(f"第 {result_index} 个 M 值格式异常：{format_value_for_message(value)}")
-
-    if isinstance(value, Real):
-        number = float(value)
-    elif isinstance(value, str):
-        text = normalize_text(value)
-        if "," in text and "." not in text:
-            text = text.replace(",", ".")
-        try:
-            number = float(text)
-        except ValueError as exc:
-            raise ExcelProcessError(
-                f"第 {result_index} 个 M 值格式异常：{format_value_for_message(value)}"
-            ) from exc
-    else:
-        raise ExcelProcessError(f"第 {result_index} 个 M 值格式异常：{format_value_for_message(value)}")
-
-    if not math.isfinite(number):
-        raise ExcelProcessError(f"第 {result_index} 个 M 值不是有效数字：{format_value_for_message(value)}")
-
-    return number
+    return _parse_float_cell_value(value, f"第 {result_index} 个 M 值")
 
 
 def parse_result_pressure_value(value, result_index: int) -> float:
     """解析右侧结果区 K 列运行压力值，用于最终校验。"""
-    if isinstance(value, bool):
-        raise ExcelProcessError(f"第 {result_index} 个 K 值格式异常：{format_value_for_message(value)}")
-
-    if isinstance(value, Real):
-        number = float(value)
-    elif isinstance(value, str):
-        text = normalize_text(value)
-        if "," in text and "." not in text:
-            text = text.replace(",", ".")
-        try:
-            number = float(text)
-        except ValueError as exc:
-            raise ExcelProcessError(
-                f"第 {result_index} 个 K 值格式异常：{format_value_for_message(value)}"
-            ) from exc
-    else:
-        raise ExcelProcessError(f"第 {result_index} 个 K 值格式异常：{format_value_for_message(value)}")
-
-    if not math.isfinite(number):
-        raise ExcelProcessError(f"第 {result_index} 个 K 值不是有效数字：{format_value_for_message(value)}")
-
-    return number
+    return _parse_float_cell_value(value, f"第 {result_index} 个 K 值")
 
 
 def pressures_are_equal(left: float, right: float) -> bool:
@@ -2518,7 +2462,7 @@ def write_all_result_m_average(worksheet, result_count: int) -> float:
     return average_value
 
 
-def format_output_sheet(worksheet, last_output_data_row: int, result_count: int) -> None:
+def format_output_sheet(worksheet: object, last_output_data_row: int, result_count: int) -> None:
     """做少量格式整理，重点是稳定可读，不做复杂美化。"""
     try:
         if last_output_data_row >= 3:
@@ -3137,23 +3081,11 @@ def process_with_test_mode(
             output_directory=test_mode_options.output_directory,
             manual_switch_index=test_mode_options.manual_switch_index,
         )
-        if layout_result.pressure_switch_index > 0:
-            switch_source = "自动识别" if layout_result.pressure_switch_auto_detected else "手动输入"
-            mode_detail = (
-                f"实验模式：{MODE_PURE_WATER}\n"
-                f"时间s：{runtime_settings.time_seconds:g}\n"
-                f"膜面积cm2：{runtime_settings.membrane_area_cm2:g}\n"
-                f"结果行数：{layout_result.result_count}\n"
-                f"压力切换编号：{layout_result.pressure_switch_index}（{switch_source}）"
-            )
-        else:
-            mode_detail = (
-                f"实验模式：{MODE_PURE_WATER}\n"
-                f"时间s：{runtime_settings.time_seconds:g}\n"
-                f"膜面积cm2：{runtime_settings.membrane_area_cm2:g}\n"
-                f"结果行数：{layout_result.result_count}\n"
-                "压力模式：单一压力"
-            )
+        mode_detail = _build_mode_detail(
+            MODE_PURE_WATER,
+            runtime_settings,
+            layout_result,
+        )
         return output_path, layout_result, mode_detail
 
     if test_mode_options.experiment_mode == MODE_POLLUTANT:
@@ -3169,13 +3101,12 @@ def process_with_test_mode(
             runtime_settings,
             output_directory=test_mode_options.output_directory,
         )
-        mode_detail = (
-            f"实验模式：{MODE_POLLUTANT}\n"
-            f"时间s：{runtime_settings.time_seconds:g}\n"
-            f"膜面积cm2：{runtime_settings.membrane_area_cm2:g}\n"
-            f"结果行数：{layout_result.result_count}\n"
-            f"运行压力bar：{test_mode_options.pressure_bar:g}\n"
-            f"纯水通量：{test_mode_options.pure_water_flux:g}"
+        mode_detail = _build_mode_detail(
+            MODE_POLLUTANT,
+            runtime_settings,
+            layout_result,
+            pressure_bar=test_mode_options.pressure_bar,
+            pure_water_flux=test_mode_options.pure_water_flux,
         )
         return output_path, layout_result, mode_detail
 
@@ -3264,25 +3195,13 @@ def main(
                     pressure_settings,
                     runtime_settings,
                 )
-                if layout_result.pressure_switch_index > 0:
-                    switch_source = "自动识别" if layout_result.pressure_switch_auto_detected else "手动输入"
-                    mode_detail = (
-                        f"实验模式：{MODE_PURE_WATER}\n"
-                        f"时间s：{runtime_settings.time_seconds:g}\n"
-                        f"膜面积cm2：{runtime_settings.membrane_area_cm2:g}\n"
-                        f"结果行数：{layout_result.result_count}\n"
-                        f"压力切换编号：{layout_result.pressure_switch_index}（{switch_source}）"
-                    )
-                else:
-                    mode_detail = (
-                        f"实验模式：{MODE_PURE_WATER}\n"
-                        f"时间s：{runtime_settings.time_seconds:g}\n"
-                        f"膜面积cm2：{runtime_settings.membrane_area_cm2:g}\n"
-                        f"结果行数：{layout_result.result_count}\n"
-                        "压力模式：单一压力"
-                    )
+                mode_detail = _build_mode_detail(
+                    MODE_PURE_WATER,
+                    runtime_settings,
+                    layout_result,
+                )
             elif experiment_mode == MODE_POLLUTANT:
-                pressure_bar = get_single_pressure("运行压力")
+                pressure_bar = get_pressure_input("运行压力")
                 pure_water_flux = get_pure_water_flux_input()
                 debug_log_event(
                     "main_manual_pollutant_before_core",
@@ -3298,13 +3217,12 @@ def main(
                     pure_water_flux,
                     runtime_settings,
                 )
-                mode_detail = (
-                    f"实验模式：{MODE_POLLUTANT}\n"
-                    f"时间s：{runtime_settings.time_seconds:g}\n"
-                    f"膜面积cm2：{runtime_settings.membrane_area_cm2:g}\n"
-                    f"结果行数：{layout_result.result_count}\n"
-                    f"运行压力bar：{pressure_bar:g}\n"
-                    f"纯水通量：{pure_water_flux:g}"
+                mode_detail = _build_mode_detail(
+                    MODE_POLLUTANT,
+                    runtime_settings,
+                    layout_result,
+                    pressure_bar=pressure_bar,
+                    pure_water_flux=pure_water_flux,
                 )
             else:
                 raise ExcelProcessError(f"未知实验模式：{experiment_mode}")
