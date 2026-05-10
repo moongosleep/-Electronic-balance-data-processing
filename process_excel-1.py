@@ -42,6 +42,7 @@ import sys
 import traceback
 import unicodedata
 from datetime import date, datetime, time as datetime_time
+from decimal import Decimal, InvalidOperation
 from numbers import Real
 from pathlib import Path
 from typing import Callable, Iterable, List, NamedTuple, Optional, Sequence, Tuple
@@ -153,6 +154,8 @@ COL_POLLUTANT_5_GROUP_PERMEABILITY = 21
 COL_POLLUTANT_5_GROUP_NORMALIZED = 22
 COL_STANDARD_10MIN_PERMEABILITY = 24
 COL_STANDARD_10MIN_NORMALIZED = 25
+COL_CUSTOM_AVERAGE_PERMEABILITY = 27
+COL_CUSTOM_AVERAGE_NORMALIZED = 28
 
 STANDARD_10MIN_REQUIRED_COUNT = 150
 STANDARD_10MIN_GROUP_SIZE = 30
@@ -238,6 +241,16 @@ class RuntimeSettings(NamedTuple):
     membrane_area_cm2: float
 
 
+class CustomAverageSettings(NamedTuple):
+    """污染物模式用户指定平均点散点分析配置。"""
+
+    minutes_per_point: float
+    point_count: int
+    points_per_group: int
+    total_minutes: float
+    name_prefix: str
+
+
 class TestModeOptions(NamedTuple):
     """\u6279\u91cf\u81ea\u67e5\u65f6\u7528\u4e8e\u6ce8\u5165\u7684\u975e\u4ea4\u4e92\u53c2\u6570\u3002"""
 
@@ -250,6 +263,7 @@ class TestModeOptions(NamedTuple):
     output_directory: Optional[Path] = None
     allow_xlsm_input: bool = False
     show_messages: bool = False
+    custom_average_settings: Optional[CustomAverageSettings] = None
 
 class OutputLayoutResult(NamedTuple):
     """输出布局生成后的摘要信息。"""
@@ -677,6 +691,21 @@ def parse_positive_float(text: str, value_name: str = "????") -> float:
     return value
 
 
+def parse_positive_int(text: str, value_name: str) -> int:
+    """解析必须大于 0 的整数输入。"""
+    normalized = normalize_text(text)
+
+    try:
+        value = int(normalized)
+    except ValueError as exc:
+        raise ExcelProcessError(f"{value_name}必须是大于 0 的整数。") from exc
+
+    if value <= 0:
+        raise ExcelProcessError(f"{value_name}必须是大于 0 的整数。")
+
+    return value
+
+
 def format_default_numeric_text(value: float) -> str:
     """\u628a\u9ed8\u8ba4\u6570\u503c\u683c\u5f0f\u5316\u4e3a\u66f4\u9002\u5408\u663e\u793a\u5728\u8f93\u5165\u6846\u91cc\u7684\u6587\u672c\u3002"""
     if float(value).is_integer():
@@ -820,6 +849,168 @@ def get_pure_water_flux_input() -> float:
         value_name="\u7eaf\u6c34\u901a\u91cf",
         cli_prompt_text="\u8bf7\u8f93\u5165\u7eaf\u6c34\u901a\u91cf\uff0c\u76f4\u63a5\u56de\u8f66\u53d6\u6d88\uff1a",
     )
+
+
+def format_decimal_for_name(value: Decimal) -> str:
+    """把 Decimal 格式化成适合写入表头和工作表名的短文本。"""
+    normalized = value.normalize()
+    if normalized == normalized.to_integral_value():
+        return str(int(normalized))
+    return format(normalized, "f").rstrip("0").rstrip(".")
+
+
+def build_custom_average_settings(
+    minutes_per_point: float,
+    point_count: int,
+    runtime_settings: RuntimeSettings,
+) -> CustomAverageSettings:
+    """根据用户输入计算每组点数，并生成 AA/AB 与图表共用的名称前缀。"""
+    try:
+        minutes_decimal = Decimal(str(minutes_per_point))
+        time_decimal = Decimal(str(runtime_settings.time_seconds))
+        total_minutes_decimal = minutes_decimal * Decimal(point_count)
+        source_seconds_decimal = minutes_decimal * Decimal("60")
+        remainder = source_seconds_decimal % time_decimal
+    except (InvalidOperation, ZeroDivisionError) as exc:
+        raise ExcelProcessError("平均分钟数无法被当前采样时间整除，请重新输入。") from exc
+
+    if remainder != 0:
+        raise ExcelProcessError("平均分钟数无法被当前采样时间整除，请重新输入。")
+
+    points_per_group_decimal = source_seconds_decimal / time_decimal
+    if points_per_group_decimal <= 0 or points_per_group_decimal != points_per_group_decimal.to_integral_value():
+        raise ExcelProcessError("平均分钟数无法被当前采样时间整除，请重新输入。")
+
+    points_per_group = int(points_per_group_decimal)
+    total_minutes_text = format_decimal_for_name(total_minutes_decimal)
+    name_prefix = f"{total_minutes_text}min-{point_count}散点"
+
+    return CustomAverageSettings(
+        minutes_per_point=minutes_per_point,
+        point_count=point_count,
+        points_per_group=points_per_group,
+        total_minutes=float(total_minutes_decimal),
+        name_prefix=name_prefix,
+    )
+
+
+def get_pollutant_custom_average_settings(
+    runtime_settings: RuntimeSettings,
+) -> Optional[CustomAverageSettings]:
+    """
+    获取污染物模式“用户指定平均点”配置。
+
+    该窗口属于新增功能：用户取消或关闭时仅跳过新增 AA/AB 与新图表，
+    污染物模式原有 G:M、O:V、X:Y 和既有散点图继续生成。
+    """
+    root = get_tk_root()
+
+    if root is not None and tk is not None:
+        selected = {"settings": None, "cancelled": False}
+        dialog = tk.Toplevel(root)
+        dialog.title("散点平均点设置")
+        dialog.resizable(False, False)
+        dialog.grab_set()
+
+        try:
+            dialog.attributes("-topmost", True)
+        except Exception:
+            pass
+
+        tk.Label(dialog, text="请填写新增散点分析参数：", anchor="w").grid(
+            row=0,
+            column=0,
+            columnspan=2,
+            padx=18,
+            pady=(16, 10),
+            sticky="w",
+        )
+        tk.Label(dialog, text="每几分钟作为一个平均点：", anchor="e").grid(
+            row=1,
+            column=0,
+            padx=(18, 8),
+            pady=6,
+            sticky="e",
+        )
+        tk.Label(dialog, text="一共需要几个平均点：", anchor="e").grid(
+            row=2,
+            column=0,
+            padx=(18, 8),
+            pady=6,
+            sticky="e",
+        )
+
+        minutes_var = tk.StringVar(master=dialog)
+        point_count_var = tk.StringVar(master=dialog)
+        minutes_entry = tk.Entry(dialog, textvariable=minutes_var, width=18)
+        point_count_entry = tk.Entry(dialog, textvariable=point_count_var, width=18)
+        minutes_entry.grid(row=1, column=1, padx=(0, 18), pady=6, sticky="we")
+        point_count_entry.grid(row=2, column=1, padx=(0, 18), pady=6, sticky="we")
+
+        button_frame = tk.Frame(dialog)
+        button_frame.grid(row=3, column=0, columnspan=2, pady=(10, 16))
+
+        def submit() -> None:
+            try:
+                minutes_per_point = parse_positive_float(
+                    minutes_var.get(),
+                    "每几分钟作为一个平均点",
+                )
+                point_count = parse_positive_int(
+                    point_count_var.get(),
+                    "一共需要几个平均点",
+                )
+                settings = build_custom_average_settings(
+                    minutes_per_point,
+                    point_count,
+                    runtime_settings,
+                )
+            except ExcelProcessError as exc:
+                if messagebox is not None:
+                    messagebox.showwarning("输入无效", str(exc), parent=dialog)
+                return
+
+            selected["settings"] = settings
+            dialog.destroy()
+
+        def cancel() -> None:
+            selected["cancelled"] = True
+            dialog.destroy()
+
+        tk.Button(button_frame, text="确定", width=10, command=submit).pack(side="right", padx=(8, 0))
+        tk.Button(button_frame, text="取消", width=10, command=cancel).pack(side="right")
+
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        minutes_entry.bind("<Return>", lambda _event: submit())
+        point_count_entry.bind("<Return>", lambda _event: submit())
+
+        _center_and_focus_window(dialog, 380, 180)
+
+        minutes_entry.focus_set()
+        root.wait_window(dialog)
+
+        if selected["cancelled"]:
+            return None
+        return selected["settings"]
+
+    while True:
+        minutes_text = input("请输入每几分钟作为一个平均点，直接回车跳过新增散点分析：").strip()
+        if not minutes_text:
+            return None
+        point_count_text = input("请输入一共需要几个平均点，直接回车跳过新增散点分析：").strip()
+        if not point_count_text:
+            return None
+
+        try:
+            minutes_per_point = parse_positive_float(minutes_text, "每几分钟作为一个平均点")
+            point_count = parse_positive_int(point_count_text, "一共需要几个平均点")
+            return build_custom_average_settings(
+                minutes_per_point,
+                point_count,
+                runtime_settings,
+            )
+        except ExcelProcessError as exc:
+            print(f"输入无效：{exc}")
 
 
 def get_pressure_inputs() -> PressureSettings:
@@ -1988,6 +2179,132 @@ def write_pollutant_standard_10min_area(
     return STANDARD_10MIN_GROUP_COUNT + 1
 
 
+def clear_pollutant_custom_average_area(worksheet, point_count: int, last_output_data_row: int) -> None:
+    """清空污染物模式 AA:AB 用户指定平均点区域，Z 列保留为空白间隔。"""
+    clear_to_row = max(last_output_data_row + 5, point_count + 3, 40)
+    try:
+        worksheet.Range(
+            worksheet.Cells(2, COL_CUSTOM_AVERAGE_PERMEABILITY),
+            worksheet.Cells(clear_to_row, COL_CUSTOM_AVERAGE_NORMALIZED),
+        ).ClearContents()
+    except Exception as exc:
+        raise ExcelProcessError("清空污染物模式 AA:AB 散点分析区失败。") from exc
+
+
+def write_pollutant_custom_average_area(
+    worksheet,
+    last_output_data_row: int,
+    pressure_bar: float,
+    pure_water_flux: float,
+    runtime_settings: RuntimeSettings,
+    custom_settings: CustomAverageSettings,
+) -> int:
+    """
+    生成污染物模式 AA:AB 用户指定平均点结果区。
+
+    数据源固定为 C3 开始的液滴质量差，每组点数由用户输入分钟数和采样时间换算。
+    """
+    c_start_row = 3
+    c_count = max(last_output_data_row - 2, 0)
+    required_count = custom_settings.points_per_group * custom_settings.point_count
+    if c_count < required_count:
+        raise ExcelProcessError("当前C列有效数据不足，无法生成指定数量的平均点，请检查原始数据长度。")
+
+    clear_pollutant_custom_average_area(
+        worksheet,
+        custom_settings.point_count,
+        last_output_data_row,
+    )
+
+    try:
+        worksheet.Cells(2, COL_CUSTOM_AVERAGE_PERMEABILITY).Value = (
+            f"{custom_settings.name_prefix}-渗透性"
+        )
+        worksheet.Cells(2, COL_CUSTOM_AVERAGE_NORMALIZED).Value = (
+            f"{custom_settings.name_prefix}-归一化通量"
+        )
+        worksheet.Range(
+            worksheet.Cells(2, COL_CUSTOM_AVERAGE_PERMEABILITY),
+            worksheet.Cells(2, COL_CUSTOM_AVERAGE_NORMALIZED),
+        ).Font.Bold = True
+
+        # 第 3 行写入纯水通量基准，AB3 通过引用 AA3 得到归一化起点 1。
+        worksheet.Cells(3, COL_CUSTOM_AVERAGE_PERMEABILITY).Value = pure_water_flux
+        worksheet.Cells(3, COL_CUSTOM_AVERAGE_NORMALIZED).Formula = (
+            pollutant_normalized_formula(COL_CUSTOM_AVERAGE_PERMEABILITY, 3)
+        )
+
+        for group_index in range(custom_settings.point_count):
+            source_start_row = c_start_row + group_index * custom_settings.points_per_group
+            source_end_row = source_start_row + custom_settings.points_per_group - 1
+            output_row = 4 + group_index
+
+            worksheet.Cells(output_row, COL_CUSTOM_AVERAGE_PERMEABILITY).Formula = (
+                pollutant_permeability_formula(
+                    source_start_row,
+                    source_end_row,
+                    pressure_bar,
+                    runtime_settings,
+                )
+            )
+            worksheet.Cells(output_row, COL_CUSTOM_AVERAGE_NORMALIZED).Formula = (
+                pollutant_normalized_formula(COL_CUSTOM_AVERAGE_PERMEABILITY, output_row)
+            )
+
+        worksheet.Range(
+            worksheet.Cells(3, COL_CUSTOM_AVERAGE_PERMEABILITY),
+            worksheet.Cells(custom_settings.point_count + 3, COL_CUSTOM_AVERAGE_NORMALIZED),
+        ).NumberFormat = "0.000000"
+        worksheet.Columns("AA:AB").AutoFit()
+    except Exception as exc:
+        raise ExcelProcessError("写入污染物模式 AA:AB 散点分析区失败。") from exc
+
+    return custom_settings.point_count + 1
+
+
+def get_or_create_custom_average_scatter_sheet(workbook, sheet_name: str):
+    """获取或新建用户指定平均点散点图工作表。"""
+    try:
+        for index in range(1, int(workbook.Worksheets.Count) + 1):
+            candidate = workbook.Worksheets(index)
+            if str(candidate.Name) == sheet_name:
+                return candidate
+
+        chart_sheet = workbook.Worksheets.Add(
+            After=workbook.Worksheets(int(workbook.Worksheets.Count))
+        )
+        chart_sheet.Name = sheet_name
+        return chart_sheet
+    except Exception as exc:
+        raise ExcelProcessError(f"创建散点图工作表“{sheet_name}”失败。") from exc
+
+
+def create_custom_average_scatter_sheet(
+    source_worksheet,
+    custom_settings: CustomAverageSettings,
+) -> None:
+    """生成单独的用户指定平均点散点图工作表。"""
+    sheet_name = f"{custom_settings.name_prefix}图"
+    workbook = source_worksheet.Parent
+    chart_sheet = get_or_create_custom_average_scatter_sheet(workbook, sheet_name)
+    clear_scatter_chart_sheet(chart_sheet)
+
+    x_range, y_range = write_scatter_chart_source_data(
+        source_worksheet,
+        chart_sheet,
+        1,
+        COL_CUSTOM_AVERAGE_NORMALIZED,
+        custom_settings.point_count + 1,
+        custom_settings.name_prefix,
+    )
+    add_scatter_chart(chart_sheet, x_range, y_range, custom_settings.name_prefix, 20, 20)
+
+    try:
+        chart_sheet.Columns("A:B").AutoFit()
+    except Exception:
+        pass
+
+
 def quote_excel_sheet_name(sheet_name: str) -> str:
     """生成 Excel 公式里安全可用的工作表引用名。"""
     return "'" + sheet_name.replace("'", "''") + "'"
@@ -2694,6 +3011,7 @@ def apply_pollutant_output_layout(
     pressure_bar: float,
     pure_water_flux: float,
     runtime_settings: RuntimeSettings,
+    custom_average_settings: Optional[CustomAverageSettings] = None,
 ) -> OutputLayoutResult:
     """\u6c61\u67d3\u7269\u6a21\u5f0f\uff1a\u751f\u6210\u57fa\u7840\u5e03\u5c40\u540e\uff0c\u6574\u6bb5\u7ed3\u679c\u4f7f\u7528\u5355\u4e00\u8fd0\u884c\u538b\u529b\u3002"""
     last_output_data_row, _pure_result_count = build_common_output_layout(
@@ -2756,6 +3074,32 @@ def apply_pollutant_output_layout(
         pass
 
     create_pollutant_scatter_charts(worksheet, analysis_result)
+
+    if custom_average_settings is not None:
+        custom_point_count = write_pollutant_custom_average_area(
+            worksheet,
+            last_output_data_row,
+            pressure_bar,
+            pure_water_flux,
+            runtime_settings,
+            custom_average_settings,
+        )
+        debug_log_event(
+            "pollutant_custom_average_area_done",
+            point_count=custom_point_count,
+            points_per_group=custom_average_settings.points_per_group,
+            name_prefix=custom_average_settings.name_prefix,
+            aa3=get_cell_debug_state(worksheet, 3, COL_CUSTOM_AVERAGE_PERMEABILITY),
+            ab3=get_cell_debug_state(worksheet, 3, COL_CUSTOM_AVERAGE_NORMALIZED),
+            aa4=get_cell_debug_state(worksheet, 4, COL_CUSTOM_AVERAGE_PERMEABILITY),
+            ab4=get_cell_debug_state(worksheet, 4, COL_CUSTOM_AVERAGE_NORMALIZED),
+        )
+        try:
+            worksheet.Calculate()
+        except Exception:
+            pass
+        create_custom_average_scatter_sheet(worksheet, custom_average_settings)
+
     format_output_sheet(worksheet, last_output_data_row, result_count)
 
     return OutputLayoutResult(
@@ -2995,6 +3339,7 @@ def process_pollutant(
     pure_water_flux: float,
     runtime_settings: RuntimeSettings,
     output_directory: Optional[Path] = None,
+    custom_average_settings: Optional[CustomAverageSettings] = None,
 ) -> Tuple[Path, OutputLayoutResult]:
     """?????????????????????????"""
     debug_context = {
@@ -3003,6 +3348,7 @@ def process_pollutant(
         "membrane_area_cm2": runtime_settings.membrane_area_cm2,
         "pressure_bar": pressure_bar,
         "pure_water_flux": pure_water_flux,
+        "custom_average_settings": custom_average_settings,
     }
     debug_log_event(
         "process_pollutant_start",
@@ -3019,6 +3365,7 @@ def process_pollutant(
             pressure_bar,
             pure_water_flux,
             runtime_settings,
+            custom_average_settings,
         ),
         output_directory=output_directory,
         debug_context=debug_context,
@@ -3060,6 +3407,7 @@ def process_with_test_mode(
         pressure_settings=test_mode_options.pressure_settings,
         pressure_bar=test_mode_options.pressure_bar,
         pure_water_flux=test_mode_options.pure_water_flux,
+        custom_average_settings=test_mode_options.custom_average_settings,
         manual_switch_index=test_mode_options.manual_switch_index,
         output_directory=test_mode_options.output_directory,
         allow_xlsm_input=test_mode_options.allow_xlsm_input,
@@ -3100,6 +3448,7 @@ def process_with_test_mode(
             test_mode_options.pure_water_flux,
             runtime_settings,
             output_directory=test_mode_options.output_directory,
+            custom_average_settings=test_mode_options.custom_average_settings,
         )
         mode_detail = _build_mode_detail(
             MODE_POLLUTANT,
@@ -3145,6 +3494,7 @@ def main(
                 pressure_settings=test_mode_options.pressure_settings,
                 pressure_bar=test_mode_options.pressure_bar,
                 pure_water_flux=test_mode_options.pure_water_flux,
+                custom_average_settings=test_mode_options.custom_average_settings,
                 manual_switch_index=test_mode_options.manual_switch_index,
                 output_directory=test_mode_options.output_directory,
             )
@@ -3203,6 +3553,7 @@ def main(
             elif experiment_mode == MODE_POLLUTANT:
                 pressure_bar = get_pressure_input("运行压力")
                 pure_water_flux = get_pure_water_flux_input()
+                custom_average_settings = get_pollutant_custom_average_settings(runtime_settings)
                 debug_log_event(
                     "main_manual_pollutant_before_core",
                     input_path=input_path,
@@ -3210,12 +3561,14 @@ def main(
                     membrane_area_cm2=runtime_settings.membrane_area_cm2,
                     pressure_bar=pressure_bar,
                     pure_water_flux=pure_water_flux,
+                    custom_average_settings=custom_average_settings,
                 )
                 output_path, layout_result = process_pollutant(
                     input_path,
                     pressure_bar,
                     pure_water_flux,
                     runtime_settings,
+                    custom_average_settings=custom_average_settings,
                 )
                 mode_detail = _build_mode_detail(
                     MODE_POLLUTANT,

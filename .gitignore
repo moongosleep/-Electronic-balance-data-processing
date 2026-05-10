@@ -9,6 +9,7 @@ batch_test_report.txt
 batch_test_outputs/
 
 # Excel 处理输出
+text-excel.xls
 *.xlsm
 ~$*
 
