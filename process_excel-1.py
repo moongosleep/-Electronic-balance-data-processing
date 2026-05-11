@@ -36,6 +36,7 @@ Windows 下 Excel 实验数据处理工具。
 from __future__ import annotations
 
 import atexit
+import json
 import math
 import os
 import sys
@@ -92,6 +93,13 @@ AVG_GROUP_2 = 10
 # 右侧结果区固定参数。
 DEFAULT_TIME_SECONDS = 4.0
 DEFAULT_MEMBRANE_AREA_CM2 = 12.57
+DEFAULT_PURE_FIRST_PRESSURE = 2.0
+DEFAULT_PURE_SECOND_PRESSURE = 1.5
+DEFAULT_POLLUTANT_PRESSURE = 1.5
+DEFAULT_CUSTOM_AVERAGE_ENABLED = False
+DEFAULT_CUSTOM_MINUTES_PER_POINT = 2.0
+DEFAULT_CUSTOM_POINT_COUNT = 5
+SETTINGS_FILE_NAME = "settings.json"
 
 # 压力切换点自动识别规则：
 # 至少前面已有 5 个 H 值时，才允许判断；
@@ -251,6 +259,19 @@ class CustomAverageSettings(NamedTuple):
     name_prefix: str
 
 
+class AppSettings(NamedTuple):
+    """主窗口默认值配置，会保存到 settings.json。"""
+
+    time_seconds: float
+    membrane_area_cm2: float
+    pure_first_pressure: float
+    pure_second_pressure: float
+    pollutant_pressure: float
+    custom_average_enabled: bool
+    custom_minutes_per_point: float
+    custom_point_count: int
+
+
 class TestModeOptions(NamedTuple):
     """\u6279\u91cf\u81ea\u67e5\u65f6\u7528\u4e8e\u6ce8\u5165\u7684\u975e\u4ea4\u4e92\u53c2\u6570\u3002"""
 
@@ -264,6 +285,20 @@ class TestModeOptions(NamedTuple):
     allow_xlsm_input: bool = False
     show_messages: bool = False
     custom_average_settings: Optional[CustomAverageSettings] = None
+
+
+class MainWindowResult(NamedTuple):
+    """主参数窗口点击“开始处理”后返回的完整输入。"""
+
+    input_path: Path
+    experiment_mode: str
+    runtime_settings: RuntimeSettings
+    pressure_settings: Optional[PressureSettings] = None
+    pollutant_pressure: Optional[float] = None
+    pure_water_flux: Optional[float] = None
+    custom_average_enabled: bool = False
+    custom_average_settings: Optional[CustomAverageSettings] = None
+
 
 class OutputLayoutResult(NamedTuple):
     """输出布局生成后的摘要信息。"""
@@ -711,6 +746,504 @@ def format_default_numeric_text(value: float) -> str:
     if float(value).is_integer():
         return str(int(value))
     return f"{value:g}"
+
+
+def get_builtin_app_settings() -> AppSettings:
+    """返回代码内置默认值，settings.json 缺失或损坏时使用。"""
+    return AppSettings(
+        time_seconds=DEFAULT_TIME_SECONDS,
+        membrane_area_cm2=DEFAULT_MEMBRANE_AREA_CM2,
+        pure_first_pressure=DEFAULT_PURE_FIRST_PRESSURE,
+        pure_second_pressure=DEFAULT_PURE_SECOND_PRESSURE,
+        pollutant_pressure=DEFAULT_POLLUTANT_PRESSURE,
+        custom_average_enabled=DEFAULT_CUSTOM_AVERAGE_ENABLED,
+        custom_minutes_per_point=DEFAULT_CUSTOM_MINUTES_PER_POINT,
+        custom_point_count=DEFAULT_CUSTOM_POINT_COUNT,
+    )
+
+
+def get_program_directory() -> Path:
+    """获取脚本或打包 exe 所在目录，避免 PyInstaller onefile 写入临时解压目录。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def get_fallback_settings_path() -> Path:
+    """程序目录不可写时，将配置保存到用户目录下。"""
+    return Path.home() / ".excel处理工具" / SETTINGS_FILE_NAME
+
+
+def iter_settings_paths() -> Tuple[Path, Path]:
+    """按优先级返回 settings.json 的读取候选路径。"""
+    return (
+        get_program_directory() / SETTINGS_FILE_NAME,
+        get_fallback_settings_path(),
+    )
+
+
+def parse_bool_setting(value, default: bool) -> bool:
+    """宽松读取布尔配置，兼容 json 中的 true/false 和少量文本写法。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = normalize_text(value).lower()
+        if normalized in ("true", "1", "yes", "y", "on"):
+            return True
+        if normalized in ("false", "0", "no", "n", "off"):
+            return False
+    return default
+
+
+def build_app_settings_from_mapping(data: object, defaults: AppSettings) -> AppSettings:
+    """从 settings.json 内容中合并默认值；字段缺失或异常时使用内置默认值。"""
+    if not isinstance(data, dict):
+        return defaults
+
+    def get_float(key: str, value_name: str, default: float) -> float:
+        if key not in data:
+            return default
+        try:
+            return parse_positive_float(str(data[key]), value_name)
+        except ExcelProcessError:
+            return default
+
+    def get_int(key: str, value_name: str, default: int) -> int:
+        if key not in data:
+            return default
+        try:
+            return parse_positive_int(str(data[key]), value_name)
+        except ExcelProcessError:
+            return default
+
+    return AppSettings(
+        time_seconds=get_float("time_seconds", "默认时间s", defaults.time_seconds),
+        membrane_area_cm2=get_float("membrane_area_cm2", "默认膜面积cm2", defaults.membrane_area_cm2),
+        pure_first_pressure=get_float(
+            "pure_first_pressure",
+            "默认前半段压力bar",
+            defaults.pure_first_pressure,
+        ),
+        pure_second_pressure=get_float(
+            "pure_second_pressure",
+            "默认后半段压力bar",
+            defaults.pure_second_pressure,
+        ),
+        pollutant_pressure=get_float(
+            "pollutant_pressure",
+            "默认运行压力bar",
+            defaults.pollutant_pressure,
+        ),
+        custom_average_enabled=parse_bool_setting(
+            data.get("custom_average_enabled"),
+            defaults.custom_average_enabled,
+        ),
+        custom_minutes_per_point=get_float(
+            "custom_minutes_per_point",
+            "默认每几分钟作为一个平均点",
+            defaults.custom_minutes_per_point,
+        ),
+        custom_point_count=get_int(
+            "custom_point_count",
+            "默认平均点数量",
+            defaults.custom_point_count,
+        ),
+    )
+
+
+def app_settings_to_dict(settings: AppSettings) -> dict:
+    """转换为可写入 settings.json 的普通字典。"""
+    return {
+        "time_seconds": settings.time_seconds,
+        "membrane_area_cm2": settings.membrane_area_cm2,
+        "pure_first_pressure": settings.pure_first_pressure,
+        "pure_second_pressure": settings.pure_second_pressure,
+        "pollutant_pressure": settings.pollutant_pressure,
+        "custom_average_enabled": settings.custom_average_enabled,
+        "custom_minutes_per_point": settings.custom_minutes_per_point,
+        "custom_point_count": settings.custom_point_count,
+    }
+
+
+def load_app_settings() -> AppSettings:
+    """启动时加载默认值；读取失败时静默回退到内置默认值。"""
+    defaults = get_builtin_app_settings()
+    for settings_path in iter_settings_paths():
+        if not settings_path.exists():
+            continue
+        try:
+            with settings_path.open("r", encoding="utf-8") as handle:
+                return build_app_settings_from_mapping(json.load(handle), defaults)
+        except Exception as exc:
+            debug_log_event("settings_load_failed", settings_path=settings_path, message=exc)
+            return defaults
+    return defaults
+
+
+def save_app_settings(settings: AppSettings) -> Path:
+    """保存默认值；程序目录不可写时自动回退到用户目录。"""
+    last_error = None
+    for settings_path in iter_settings_paths():
+        try:
+            settings_path.parent.mkdir(parents=True, exist_ok=True)
+            with settings_path.open("w", encoding="utf-8") as handle:
+                json.dump(app_settings_to_dict(settings), handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+            return settings_path
+        except Exception as exc:
+            last_error = exc
+            debug_log_event("settings_save_failed", settings_path=settings_path, message=exc)
+
+    raise ExcelProcessError(f"保存默认值失败：{last_error}")
+
+
+def show_main_parameter_window(initial_input_path: Optional[Path]) -> MainWindowResult:
+    """
+    显示唯一主参数窗口，在同一窗口内完成模式、文件、参数和默认值设置。
+
+    文件选择按钮会调用系统文件选择框；除此之外不再串联旧的多个输入窗口。
+    """
+    global _TK_ROOT
+
+    if tk is None:
+        raise ExcelProcessError("当前 Python 环境没有可用的 tkinter，无法显示主参数窗口。")
+
+    root = get_tk_root()
+    if root is None:
+        raise ExcelProcessError("当前 Python 环境没有可用的 tkinter，无法显示主参数窗口。")
+
+    for child in root.winfo_children():
+        child.destroy()
+
+    settings_holder = {"settings": load_app_settings()}
+    selected = {"result": None, "cancelled": False}
+
+    root.title("Excel 数据处理参数")
+    root.resizable(True, True)
+    root.deiconify()
+
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+
+    main_frame = tk.Frame(root, padx=18, pady=14)
+    main_frame.grid(row=0, column=0, sticky="nsew")
+    main_frame.columnconfigure(0, weight=1)
+
+    settings = settings_holder["settings"]
+    initial_path_text = "" if initial_input_path is None else str(initial_input_path)
+
+    file_path_var = tk.StringVar(master=root, value=initial_path_text)
+    mode_var = tk.StringVar(master=root, value=MODE_PURE_WATER)
+    time_var = tk.StringVar(master=root, value=format_default_numeric_text(settings.time_seconds))
+    area_var = tk.StringVar(master=root, value=format_default_numeric_text(settings.membrane_area_cm2))
+    pure_first_var = tk.StringVar(master=root, value=format_default_numeric_text(settings.pure_first_pressure))
+    pure_second_var = tk.StringVar(master=root, value=format_default_numeric_text(settings.pure_second_pressure))
+    pollutant_pressure_var = tk.StringVar(
+        master=root,
+        value=format_default_numeric_text(settings.pollutant_pressure),
+    )
+    # 纯水通量每次污染物实验都可能不同，不保存为默认值，启动时留空让用户填写本次真实值。
+    pure_flux_var = tk.StringVar(master=root, value="")
+    custom_enabled_var = tk.BooleanVar(master=root, value=settings.custom_average_enabled)
+    custom_minutes_var = tk.StringVar(
+        master=root,
+        value=format_default_numeric_text(settings.custom_minutes_per_point),
+    )
+    custom_count_var = tk.StringVar(master=root, value=str(settings.custom_point_count))
+
+    default_time_var = tk.StringVar(master=root, value=time_var.get())
+    default_area_var = tk.StringVar(master=root, value=area_var.get())
+    default_pure_first_var = tk.StringVar(master=root, value=pure_first_var.get())
+    default_pure_second_var = tk.StringVar(master=root, value=pure_second_var.get())
+    default_pollutant_pressure_var = tk.StringVar(master=root, value=pollutant_pressure_var.get())
+    default_custom_enabled_var = tk.BooleanVar(master=root, value=settings.custom_average_enabled)
+    default_custom_minutes_var = tk.StringVar(master=root, value=custom_minutes_var.get())
+    default_custom_count_var = tk.StringVar(master=root, value=custom_count_var.get())
+
+    def make_labeled_entry(parent, row: int, label: str, variable: object, width: int = 18):
+        tk.Label(parent, text=label, anchor="e").grid(
+            row=row,
+            column=0,
+            padx=(0, 8),
+            pady=4,
+            sticky="e",
+        )
+        entry = tk.Entry(parent, textvariable=variable, width=width)
+        entry.grid(row=row, column=1, padx=(0, 0), pady=4, sticky="we")
+        return entry
+
+    def make_section(parent, title: str) -> tk.LabelFrame:
+        frame = tk.LabelFrame(parent, text=title, padx=12, pady=8)
+        frame.columnconfigure(1, weight=1)
+        return frame
+
+    file_frame = make_section(main_frame, "文件选择")
+    file_frame.grid(row=0, column=0, sticky="we", pady=(0, 10))
+    file_frame.columnconfigure(1, weight=1)
+    tk.Label(file_frame, text="Excel 文件：", anchor="e").grid(
+        row=0,
+        column=0,
+        padx=(0, 8),
+        pady=4,
+        sticky="e",
+    )
+    tk.Entry(file_frame, textvariable=file_path_var, width=72).grid(
+        row=0,
+        column=1,
+        padx=(0, 0),
+        pady=4,
+        sticky="we",
+    )
+
+    mode_frame = make_section(main_frame, "实验模式")
+    mode_frame.grid(row=1, column=0, sticky="we", pady=(0, 10))
+    tk.Radiobutton(mode_frame, text=MODE_PURE_WATER, variable=mode_var, value=MODE_PURE_WATER).grid(
+        row=0,
+        column=0,
+        padx=(0, 18),
+        pady=2,
+        sticky="w",
+    )
+    tk.Radiobutton(mode_frame, text=MODE_POLLUTANT, variable=mode_var, value=MODE_POLLUTANT).grid(
+        row=0,
+        column=1,
+        padx=(0, 18),
+        pady=2,
+        sticky="w",
+    )
+
+    common_frame = make_section(main_frame, "通用参数")
+    common_frame.grid(row=2, column=0, sticky="we", pady=(0, 10))
+    make_labeled_entry(common_frame, 0, "时间s：", time_var)
+    make_labeled_entry(common_frame, 1, "膜面积cm2：", area_var)
+
+    pure_frame = make_section(main_frame, "纯水模式参数")
+    pure_frame.grid(row=3, column=0, sticky="we", pady=(0, 10))
+    make_labeled_entry(pure_frame, 0, "前半段压力bar：", pure_first_var)
+    make_labeled_entry(pure_frame, 1, "后半段压力bar：", pure_second_var)
+
+    pollutant_frame = make_section(main_frame, "污染物模式参数")
+    pollutant_frame.grid(row=4, column=0, sticky="we", pady=(0, 10))
+    make_labeled_entry(pollutant_frame, 0, "运行压力bar：", pollutant_pressure_var)
+    make_labeled_entry(pollutant_frame, 1, "纯水通量：", pure_flux_var)
+
+    custom_frame = make_section(main_frame, "污染物平均点散点分析")
+    custom_frame.grid(row=5, column=0, sticky="we", pady=(0, 10))
+    tk.Checkbutton(
+        custom_frame,
+        text="启用平均点散点分析",
+        variable=custom_enabled_var,
+    ).grid(row=0, column=0, columnspan=2, pady=(0, 4), sticky="w")
+    custom_minutes_entry = make_labeled_entry(custom_frame, 1, "每几分钟作为一个平均点：", custom_minutes_var)
+    custom_count_entry = make_labeled_entry(custom_frame, 2, "一共需要几个平均点：", custom_count_var)
+
+    defaults_frame = make_section(main_frame, "默认值设置")
+    defaults_frame.grid(row=6, column=0, sticky="we", pady=(0, 10))
+    defaults_frame.grid_remove()
+    defaults_frame.columnconfigure(0, weight=1)
+    defaults_frame.columnconfigure(1, weight=1)
+
+    default_common_frame = make_section(defaults_frame, "通用默认值")
+    default_common_frame.grid(row=0, column=0, sticky="new", padx=(0, 8), pady=(0, 8))
+    make_labeled_entry(default_common_frame, 0, "默认时间s：", default_time_var)
+    make_labeled_entry(default_common_frame, 1, "默认膜面积cm2：", default_area_var)
+
+    default_pure_frame = make_section(defaults_frame, "纯水默认值")
+    default_pure_frame.grid(row=0, column=1, sticky="new", padx=(8, 0), pady=(0, 8))
+    make_labeled_entry(default_pure_frame, 0, "默认前半段压力bar：", default_pure_first_var)
+    make_labeled_entry(default_pure_frame, 1, "默认后半段压力bar：", default_pure_second_var)
+
+    default_pollutant_frame = make_section(defaults_frame, "污染物默认值")
+    default_pollutant_frame.grid(row=0, column=1, sticky="new", padx=(8, 0), pady=(0, 8))
+    make_labeled_entry(default_pollutant_frame, 0, "默认运行压力bar：", default_pollutant_pressure_var)
+    tk.Checkbutton(
+        default_pollutant_frame,
+        text="下次默认启用平均点散点分析",
+        variable=default_custom_enabled_var,
+    ).grid(row=1, column=0, columnspan=2, pady=4, sticky="w")
+    make_labeled_entry(default_pollutant_frame, 2, "默认每几分钟作为一个平均点：", default_custom_minutes_var)
+    make_labeled_entry(default_pollutant_frame, 3, "默认平均点数量：", default_custom_count_var)
+
+    def apply_settings_to_inputs(new_settings: AppSettings) -> None:
+        time_var.set(format_default_numeric_text(new_settings.time_seconds))
+        area_var.set(format_default_numeric_text(new_settings.membrane_area_cm2))
+        pure_first_var.set(format_default_numeric_text(new_settings.pure_first_pressure))
+        pure_second_var.set(format_default_numeric_text(new_settings.pure_second_pressure))
+        pollutant_pressure_var.set(format_default_numeric_text(new_settings.pollutant_pressure))
+        custom_enabled_var.set(new_settings.custom_average_enabled)
+        custom_minutes_var.set(format_default_numeric_text(new_settings.custom_minutes_per_point))
+        custom_count_var.set(str(new_settings.custom_point_count))
+        update_mode_sections()
+
+    def choose_file() -> None:
+        if filedialog is None:
+            if messagebox is not None:
+                messagebox.showwarning("无法选择文件", "当前环境没有可用的文件选择框。", parent=root)
+            return
+
+        selected_path = filedialog.askopenfilename(
+            parent=root,
+            title="请选择原始 Excel .xls 文件",
+            filetypes=[
+                ("Excel 97-2003 工作簿 (*.xls)", "*.xls"),
+                ("所有文件", "*.*"),
+            ],
+        )
+        if selected_path:
+            file_path_var.set(selected_path)
+
+    def update_custom_inputs() -> None:
+        state = "normal" if custom_enabled_var.get() and mode_var.get() == MODE_POLLUTANT else "disabled"
+        custom_minutes_entry.configure(state=state)
+        custom_count_entry.configure(state=state)
+
+    def update_default_sections() -> None:
+        """默认值设置区只展示当前实验模式相关的默认项。"""
+        if mode_var.get() == MODE_POLLUTANT:
+            default_pure_frame.grid_remove()
+            default_pollutant_frame.grid(row=0, column=1, sticky="new", padx=(8, 0), pady=(0, 8))
+        else:
+            default_pollutant_frame.grid_remove()
+            default_pure_frame.grid(row=0, column=1, sticky="new", padx=(8, 0), pady=(0, 8))
+
+    def update_mode_sections() -> None:
+        if mode_var.get() == MODE_POLLUTANT:
+            pure_frame.grid_remove()
+            pollutant_frame.grid()
+            custom_frame.grid()
+        else:
+            pollutant_frame.grid_remove()
+            custom_frame.grid_remove()
+            pure_frame.grid()
+        update_custom_inputs()
+        update_default_sections()
+        root.update_idletasks()
+
+    def toggle_defaults() -> None:
+        if defaults_frame.winfo_ismapped():
+            defaults_frame.grid_remove()
+        else:
+            defaults_frame.grid()
+        _center_and_focus_window(root, 820, 560)
+
+    def save_defaults() -> None:
+        try:
+            new_settings = AppSettings(
+                time_seconds=parse_positive_float(default_time_var.get(), "默认时间s"),
+                membrane_area_cm2=parse_positive_float(default_area_var.get(), "默认膜面积cm2"),
+                pure_first_pressure=parse_positive_float(default_pure_first_var.get(), "默认前半段压力bar"),
+                pure_second_pressure=parse_positive_float(default_pure_second_var.get(), "默认后半段压力bar"),
+                pollutant_pressure=parse_positive_float(default_pollutant_pressure_var.get(), "默认运行压力bar"),
+                custom_average_enabled=bool(default_custom_enabled_var.get()),
+                custom_minutes_per_point=parse_positive_float(
+                    default_custom_minutes_var.get(),
+                    "默认每几分钟作为一个平均点",
+                ),
+                custom_point_count=parse_positive_int(default_custom_count_var.get(), "默认平均点数量"),
+            )
+            saved_path = save_app_settings(new_settings)
+        except ExcelProcessError as exc:
+            if messagebox is not None:
+                messagebox.showwarning("默认值保存失败", str(exc), parent=root)
+            return
+
+        settings_holder["settings"] = new_settings
+        apply_settings_to_inputs(new_settings)
+        if messagebox is not None:
+            messagebox.showinfo("默认值已保存", f"默认值已保存到：\n{saved_path}", parent=root)
+
+    tk.Button(defaults_frame, text="保存默认值", width=12, command=save_defaults).grid(
+        row=1,
+        column=0,
+        columnspan=2,
+        pady=(8, 0),
+    )
+
+    def submit() -> None:
+        try:
+            mode = mode_var.get()
+            if mode not in (MODE_PURE_WATER, MODE_POLLUTANT):
+                raise ExcelProcessError("请先选择实验模式。")
+
+            path_text = strip_outer_quotes(file_path_var.get())
+            if not path_text:
+                raise ExcelProcessError("请先选择 Excel 文件。")
+            input_path = validate_input_file(Path(path_text).expanduser())
+
+            runtime_settings = RuntimeSettings(
+                time_seconds=parse_positive_float(time_var.get(), "时间s"),
+                membrane_area_cm2=parse_positive_float(area_var.get(), "膜面积cm2"),
+            )
+
+            if mode == MODE_PURE_WATER:
+                selected["result"] = MainWindowResult(
+                    input_path=input_path,
+                    experiment_mode=mode,
+                    runtime_settings=runtime_settings,
+                    pressure_settings=PressureSettings(
+                        first_segment_pressure=parse_positive_float(pure_first_var.get(), "前半段压力bar"),
+                        second_segment_pressure=parse_positive_float(pure_second_var.get(), "后半段压力bar"),
+                    ),
+                )
+            else:
+                custom_average_settings = None
+                custom_average_enabled = bool(custom_enabled_var.get())
+                if custom_average_enabled:
+                    custom_average_settings = build_custom_average_settings(
+                        parse_positive_float(custom_minutes_var.get(), "每几分钟作为一个平均点"),
+                        parse_positive_int(custom_count_var.get(), "一共需要几个平均点"),
+                        runtime_settings,
+                    )
+
+                selected["result"] = MainWindowResult(
+                    input_path=input_path,
+                    experiment_mode=mode,
+                    runtime_settings=runtime_settings,
+                    pollutant_pressure=parse_positive_float(pollutant_pressure_var.get(), "运行压力bar"),
+                    pure_water_flux=parse_positive_float(pure_flux_var.get(), "纯水通量"),
+                    custom_average_enabled=custom_average_enabled,
+                    custom_average_settings=custom_average_settings,
+                )
+        except ExcelProcessError as exc:
+            if messagebox is not None:
+                messagebox.showwarning("输入无效", str(exc), parent=root)
+            return
+
+        root.quit()
+
+    def cancel() -> None:
+        selected["cancelled"] = True
+        root.quit()
+
+    button_frame = tk.Frame(main_frame)
+    button_frame.grid(row=7, column=0, sticky="e", pady=(4, 0))
+    tk.Button(button_frame, text="选择Excel文件", width=14, command=choose_file).pack(side="left", padx=(0, 8))
+    tk.Button(button_frame, text="默认值设置", width=12, command=toggle_defaults).pack(side="left", padx=(0, 8))
+    tk.Button(button_frame, text="开始处理", width=12, command=submit).pack(side="left", padx=(0, 8))
+    tk.Button(button_frame, text="取消", width=10, command=cancel).pack(side="left")
+
+    mode_var.trace_add("write", lambda *_args: update_mode_sections())
+    custom_enabled_var.trace_add("write", lambda *_args: update_custom_inputs())
+    root.protocol("WM_DELETE_WINDOW", cancel)
+
+    update_mode_sections()
+    _center_and_focus_window(root, 820, 560)
+
+    print("正在显示主参数窗口；如果没有看到，请查看任务栏或按 Alt+Tab 切换窗口。")
+    root.mainloop()
+
+    try:
+        root.attributes("-topmost", False)
+        root.withdraw()
+    except Exception:
+        pass
+
+    if selected["cancelled"] or selected["result"] is None:
+        raise UserCancelledError("已取消处理，程序未生成输出文件。")
+
+    return selected["result"]
 
 
 def get_time_and_area_inputs() -> RuntimeSettings:
@@ -3503,29 +4036,27 @@ def main(
                 test_mode_options,
             )
         else:
-            experiment_mode = select_experiment_mode()
-            runtime_settings = get_time_and_area_inputs()
+            main_window_result = show_main_parameter_window(input_path)
+            input_path = main_window_result.input_path
+            experiment_mode = main_window_result.experiment_mode
+            runtime_settings = main_window_result.runtime_settings
             debug_log_event(
-                "main_manual_after_mode_and_runtime",
-                experiment_mode=experiment_mode,
-                time_seconds=runtime_settings.time_seconds,
-                membrane_area_cm2=runtime_settings.membrane_area_cm2,
-            )
-
-            if input_path is None:
-                input_path = select_input_file()
-
-            input_path = validate_input_file(input_path)
-            debug_log_event(
-                "main_manual_input_file_validated",
+                "main_manual_after_main_window",
                 experiment_mode=experiment_mode,
                 input_path=input_path,
                 time_seconds=runtime_settings.time_seconds,
                 membrane_area_cm2=runtime_settings.membrane_area_cm2,
+                pressure_settings=main_window_result.pressure_settings,
+                pollutant_pressure=main_window_result.pollutant_pressure,
+                pure_water_flux=main_window_result.pure_water_flux,
+                custom_average_enabled=main_window_result.custom_average_enabled,
+                custom_average_settings=main_window_result.custom_average_settings,
             )
 
             if experiment_mode == MODE_PURE_WATER:
-                pressure_settings = get_pressure_inputs()
+                pressure_settings = main_window_result.pressure_settings
+                if pressure_settings is None:
+                    raise ExcelProcessError("纯水模式缺少前半段/后半段压力参数。")
                 single_pressure_branch = pressures_are_equal(
                     pressure_settings.first_segment_pressure,
                     pressure_settings.second_segment_pressure,
@@ -3551,9 +4082,13 @@ def main(
                     layout_result,
                 )
             elif experiment_mode == MODE_POLLUTANT:
-                pressure_bar = get_pressure_input("运行压力")
-                pure_water_flux = get_pure_water_flux_input()
-                custom_average_settings = get_pollutant_custom_average_settings(runtime_settings)
+                pressure_bar = main_window_result.pollutant_pressure
+                pure_water_flux = main_window_result.pure_water_flux
+                if pressure_bar is None:
+                    raise ExcelProcessError("污染物模式缺少运行压力参数。")
+                if pure_water_flux is None:
+                    raise ExcelProcessError("污染物模式缺少纯水通量参数。")
+                custom_average_settings = main_window_result.custom_average_settings
                 debug_log_event(
                     "main_manual_pollutant_before_core",
                     input_path=input_path,
