@@ -160,15 +160,8 @@ COL_POLLUTANT_10_GROUP_PERMEABILITY = 19
 COL_POLLUTANT_10_GROUP_NORMALIZED = 20
 COL_POLLUTANT_5_GROUP_PERMEABILITY = 21
 COL_POLLUTANT_5_GROUP_NORMALIZED = 22
-COL_STANDARD_10MIN_PERMEABILITY = 24
-COL_STANDARD_10MIN_NORMALIZED = 25
 COL_CUSTOM_AVERAGE_PERMEABILITY = 27
 COL_CUSTOM_AVERAGE_NORMALIZED = 28
-
-STANDARD_10MIN_REQUIRED_COUNT = 150
-STANDARD_10MIN_GROUP_SIZE = 30
-STANDARD_10MIN_GROUP_COUNT = 5
-
 
 LEFT_HEADERS = {
     COL_TIME: "时间",
@@ -198,12 +191,6 @@ POLLUTANT_ANALYSIS_HEADERS = {
     COL_POLLUTANT_5_GROUP_PERMEABILITY: "5组渗透性",
     COL_POLLUTANT_5_GROUP_NORMALIZED: "5组归一化通量",
 }
-
-POLLUTANT_STANDARD_10MIN_HEADERS = {
-    COL_STANDARD_10MIN_PERMEABILITY: "标准十分钟渗透性",
-    COL_STANDARD_10MIN_NORMALIZED: "标准十分钟归一化通量",
-}
-
 
 TIME_TEXT_FORMATS = (
     "%H:%M:%S",
@@ -352,7 +339,7 @@ def _build_mode_detail(
             f"膜面积cm2：{runtime_settings.membrane_area_cm2:g}\n"
             f"结果行数：{layout_result.result_count}\n"
             f"运行压力bar：{pressure_bar:g}\n"
-            f"纯水通量：{pure_water_flux:g}"
+            f"纯水渗透性LMH/bar：{pure_water_flux:g}"
         )
 
     raise ExcelProcessError(f"未知实验模式：{mode}")
@@ -944,7 +931,7 @@ def show_main_parameter_window(initial_input_path: Optional[Path]) -> MainWindow
         master=root,
         value=format_default_numeric_text(settings.pollutant_pressure),
     )
-    # 纯水通量每次污染物实验都可能不同，不保存为默认值，启动时留空让用户填写本次真实值。
+    # 纯水渗透性每次污染物实验都可能不同，不保存为默认值，启动时留空让用户填写本次真实值。
     pure_flux_var = tk.StringVar(master=root, value="")
     custom_enabled_var = tk.BooleanVar(master=root, value=settings.custom_average_enabled)
     custom_minutes_var = tk.StringVar(
@@ -1027,7 +1014,7 @@ def show_main_parameter_window(initial_input_path: Optional[Path]) -> MainWindow
     pollutant_frame = make_section(main_frame, "污染物模式参数")
     pollutant_frame.grid(row=4, column=0, sticky="we", pady=(0, 10))
     make_labeled_entry(pollutant_frame, 0, "运行压力bar：", pollutant_pressure_var)
-    make_labeled_entry(pollutant_frame, 1, "纯水通量：", pure_flux_var)
+    make_labeled_entry(pollutant_frame, 1, "纯水渗透性LMH/bar：", pure_flux_var)
 
     custom_frame = make_section(main_frame, "污染物平均点散点分析")
     custom_frame.grid(row=5, column=0, sticky="we", pady=(0, 10))
@@ -1202,7 +1189,7 @@ def show_main_parameter_window(initial_input_path: Optional[Path]) -> MainWindow
                     experiment_mode=mode,
                     runtime_settings=runtime_settings,
                     pollutant_pressure=parse_positive_float(pollutant_pressure_var.get(), "运行压力bar"),
-                    pure_water_flux=parse_positive_float(pure_flux_var.get(), "纯水通量"),
+                    pure_water_flux=parse_positive_float(pure_flux_var.get(), "纯水渗透性LMH/bar"),
                     custom_average_enabled=custom_average_enabled,
                     custom_average_settings=custom_average_settings,
                 )
@@ -1434,7 +1421,7 @@ def get_pollutant_custom_average_settings(
     获取污染物模式“用户指定平均点”配置。
 
     该窗口属于新增功能：用户取消或关闭时仅跳过新增 AA/AB 与新图表，
-    污染物模式原有 G:M、O:V、X:Y 和既有散点图继续生成。
+    污染物模式原有 G:M、O:V 和既有散点图继续生成。
     """
     root = get_tk_root()
 
@@ -2473,9 +2460,9 @@ def write_pollutant_analysis_headers(worksheet) -> None:
 
 def write_pollutant_baseline_row(worksheet, pure_water_flux: float) -> None:
     """
-    写入污染物 O/Q/S/U 的基准纯水通量，以及 P/R/T/V 的归一化起点。
+    写入污染物 O/Q/S/U 的基准纯水渗透性，以及 P/R/T/V 的归一化起点。
 
-    P3/R3/T3/V3 都是对应基准值除以纯水通量，因此都等于 1。
+    P3/R3/T3/V3 都是对应基准值除以纯水渗透性，因此都等于 1。
     """
     pairs = (
         (COL_POLLUTANT_5_POINT_PERMEABILITY, COL_POLLUTANT_5_POINT_NORMALIZED),
@@ -2491,7 +2478,7 @@ def write_pollutant_baseline_row(worksheet, pure_water_flux: float) -> None:
                 pollutant_normalized_formula(permeability_column, 3)
             )
     except Exception as exc:
-        raise ExcelProcessError("写入污染物模式基准纯水通量失败。") from exc
+        raise ExcelProcessError("写入污染物模式基准纯水渗透性失败。") from exc
 
 
 def pollutant_normalized_formula(permeability_column: int, output_row: int) -> str:
@@ -2499,7 +2486,7 @@ def pollutant_normalized_formula(permeability_column: int, output_row: int) -> s
     污染物模式归一化公式。
 
     P/R/T/V 不再除以 Python 写死数值，而是引用各自渗透性列第 3 行
-    的基准纯水通量单元格，例如 P4 = O4/$O$3。
+    的基准纯水渗透性单元格，例如 P4 = O4/$O$3。
     """
     source_column_letter = column_letter(permeability_column)
     return f"={source_column_letter}{output_row}/${source_column_letter}$3"
@@ -2643,75 +2630,6 @@ def write_pollutant_analysis_area(
     )
 
 
-def clear_pollutant_standard_10min_area(worksheet, last_output_data_row: int) -> None:
-    """清空污染物模式 X:Y 标准十分钟结果区，避免旧内容残留。"""
-    clear_to_row = max(last_output_data_row + 5, STANDARD_10MIN_GROUP_COUNT + 3, 40)
-    try:
-        worksheet.Range(
-            worksheet.Cells(2, COL_STANDARD_10MIN_PERMEABILITY),
-            worksheet.Cells(clear_to_row, COL_STANDARD_10MIN_NORMALIZED),
-        ).ClearContents()
-    except Exception as exc:
-        raise ExcelProcessError("清空污染物模式 X:Y 标准十分钟结果区失败。") from exc
-
-
-def write_pollutant_standard_10min_area(
-    worksheet,
-    result_count: int,
-    pure_water_flux: float,
-    last_output_data_row: int,
-) -> int:
-    """
-    生成污染物模式 X:Y 标准十分钟结果区。
-
-    X 列直接基于污染物模式已经生成的 M 列渗透性结果：
-    M3:M152 对应 G=1~150，按每 30 个 M 值一组取平均，共 5 组。
-    """
-    if result_count < STANDARD_10MIN_REQUIRED_COUNT:
-        raise ExcelProcessError(
-            "标准十分钟计算需要至少150个污染物模式 M 列渗透性数据，请检查原始数据长度。"
-        )
-
-    clear_pollutant_standard_10min_area(worksheet, last_output_data_row)
-
-    try:
-        for column, title in POLLUTANT_STANDARD_10MIN_HEADERS.items():
-            worksheet.Cells(2, column).Value = title
-
-        worksheet.Range(
-            worksheet.Cells(2, COL_STANDARD_10MIN_PERMEABILITY),
-            worksheet.Cells(2, COL_STANDARD_10MIN_NORMALIZED),
-        ).Font.Bold = True
-
-        # 第 3 行写基准纯水通量；Y3 通过引用 X3 归一化，结果为 1。
-        worksheet.Cells(3, COL_STANDARD_10MIN_PERMEABILITY).Value = pure_water_flux
-        worksheet.Cells(3, COL_STANDARD_10MIN_NORMALIZED).Formula = (
-            pollutant_normalized_formula(COL_STANDARD_10MIN_PERMEABILITY, 3)
-        )
-
-        for group_index in range(STANDARD_10MIN_GROUP_COUNT):
-            output_row = 4 + group_index
-            m_start_row = 3 + group_index * STANDARD_10MIN_GROUP_SIZE
-            m_end_row = m_start_row + STANDARD_10MIN_GROUP_SIZE - 1
-
-            worksheet.Cells(output_row, COL_STANDARD_10MIN_PERMEABILITY).Formula = (
-                f"=AVERAGE(M{m_start_row}:M{m_end_row})"
-            )
-            worksheet.Cells(output_row, COL_STANDARD_10MIN_NORMALIZED).Formula = (
-                pollutant_normalized_formula(COL_STANDARD_10MIN_PERMEABILITY, output_row)
-            )
-
-        worksheet.Range(
-            worksheet.Cells(3, COL_STANDARD_10MIN_PERMEABILITY),
-            worksheet.Cells(STANDARD_10MIN_GROUP_COUNT + 3, COL_STANDARD_10MIN_NORMALIZED),
-        ).NumberFormat = "0.000000"
-        worksheet.Columns("X:Y").AutoFit()
-    except Exception as exc:
-        raise ExcelProcessError("写入污染物模式 X:Y 标准十分钟结果区失败。") from exc
-
-    return STANDARD_10MIN_GROUP_COUNT + 1
-
-
 def clear_pollutant_custom_average_area(worksheet, point_count: int, last_output_data_row: int) -> None:
     """清空污染物模式 AA:AB 用户指定平均点区域，Z 列保留为空白间隔。"""
     clear_to_row = max(last_output_data_row + 5, point_count + 3, 40)
@@ -2761,7 +2679,7 @@ def write_pollutant_custom_average_area(
             worksheet.Cells(2, COL_CUSTOM_AVERAGE_NORMALIZED),
         ).Font.Bold = True
 
-        # 第 3 行写入纯水通量基准，AB3 通过引用 AA3 得到归一化起点 1。
+        # 第 3 行写入纯水渗透性基准，AB3 通过引用 AA3 得到归一化起点 1。
         worksheet.Cells(3, COL_CUSTOM_AVERAGE_PERMEABILITY).Value = pure_water_flux
         worksheet.Cells(3, COL_CUSTOM_AVERAGE_NORMALIZED).Formula = (
             pollutant_normalized_formula(COL_CUSTOM_AVERAGE_PERMEABILITY, 3)
@@ -2941,29 +2859,12 @@ def add_scatter_chart(chart_sheet, x_range, y_range, title: str, left: int, top:
         raise ExcelProcessError(f"生成散点图“{title}”失败。") from exc
 
 
-def add_standard_10min_scatter_chart(source_worksheet, chart_sheet) -> None:
-    """
-    在散点图工作表中新增“标准十分钟”散点图。
-
-    数据来自污染物模式 Y3:Y8，第一个点 Y3 为归一化基准 1。
-    """
-    x_range, y_range = write_scatter_chart_source_data(
-        source_worksheet,
-        chart_sheet,
-        13,
-        COL_STANDARD_10MIN_NORMALIZED,
-        STANDARD_10MIN_GROUP_COUNT + 1,
-        "标准十分钟",
-    )
-    add_scatter_chart(chart_sheet, x_range, y_range, "标准十分钟", 20, 620)
-
-
 def create_pollutant_scatter_charts(
     worksheet,
     analysis_result: PollutantAnalysisResult,
 ) -> None:
     """
-    污染物模式：生成 5 张独立散点图。
+    污染物模式：生成 O:V 分析区对应的 4 张独立散点图。
 
     每张图的第一个点都来自第 3 行归一化起点，因此都是 (1, 1)。
     """
@@ -3017,10 +2918,8 @@ def create_pollutant_scatter_charts(
         )
         add_scatter_chart(chart_sheet, x_range, y_range, title, left, top)
 
-    add_standard_10min_scatter_chart(worksheet, chart_sheet)
-
     try:
-        chart_sheet.Columns("A:N").AutoFit()
+        chart_sheet.Columns("A:K").AutoFit()
     except Exception:
         pass
 
@@ -3583,23 +3482,6 @@ def apply_pollutant_output_layout(
         pure_water_flux,
         runtime_settings,
     )
-    standard_10min_point_count = write_pollutant_standard_10min_area(
-        worksheet,
-        result_count,
-        pure_water_flux,
-        last_output_data_row,
-    )
-    debug_log_event(
-        "pollutant_standard_10min_area_done",
-        result_count=result_count,
-        point_count=standard_10min_point_count,
-        x3=get_cell_debug_state(worksheet, 3, COL_STANDARD_10MIN_PERMEABILITY),
-        y3=get_cell_debug_state(worksheet, 3, COL_STANDARD_10MIN_NORMALIZED),
-        x4=get_cell_debug_state(worksheet, 4, COL_STANDARD_10MIN_PERMEABILITY),
-        y4=get_cell_debug_state(worksheet, 4, COL_STANDARD_10MIN_NORMALIZED),
-        x8=get_cell_debug_state(worksheet, 8, COL_STANDARD_10MIN_PERMEABILITY),
-        y8=get_cell_debug_state(worksheet, 8, COL_STANDARD_10MIN_NORMALIZED),
-    )
 
     try:
         worksheet.Calculate()
@@ -3973,7 +3855,7 @@ def process_with_test_mode(
         if test_mode_options.pressure_bar is None:
             raise ExcelProcessError("污染物模式缺少运行压力参数。")
         if test_mode_options.pure_water_flux is None:
-            raise ExcelProcessError("污染物模式缺少纯水通量参数。")
+            raise ExcelProcessError("污染物模式缺少纯水渗透性LMH/bar参数。")
 
         output_path, layout_result = process_pollutant(
             validated_input_path,
@@ -4087,7 +3969,7 @@ def main(
                 if pressure_bar is None:
                     raise ExcelProcessError("污染物模式缺少运行压力参数。")
                 if pure_water_flux is None:
-                    raise ExcelProcessError("污染物模式缺少纯水通量参数。")
+                    raise ExcelProcessError("污染物模式缺少纯水渗透性LMH/bar参数。")
                 custom_average_settings = main_window_result.custom_average_settings
                 debug_log_event(
                     "main_manual_pollutant_before_core",
